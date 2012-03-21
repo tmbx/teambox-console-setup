@@ -1,0 +1,8 @@
+# Create the Postgres users if required.
+<<< isnouser(root), print(Creating root user.) >>>
+CREATE USER "root" SUPERUSER;
+<<< isnouser(www-data), print(Creating www-data user.) >>>
+CREATE USER "www-data" SUPERUSER;
+<<< isnouser(external), print(Creating external user.) >>>
+CREATE USER "external" SUPERUSER;
+

@@ -1,0 +1,340 @@
+#!/bin/bash
+#
+# This scripts attempts to detect new drives added in the computer,
+# format and add them to the LVM logical volume for the root drive on
+# the computer.  This is aimed at easily upgrading the space for
+# machines runnings inside VMware Server or VMware ESX Server.
+#
+# This script tries to be kind to drives that have a partition table
+# and won't touch things it doesn't recognize as empty.  It's still a
+# pretty serious deal add a drive to a computer that may have
+# important data on it since that data will likely be broken after the
+# drive is initialized by this script.
+#
+# author: François-Denis Gonthier
+
+#
+# Script configuration.  Those variables are the only to data that the
+# scripts expect as input.
+#
+VG=teambox
+LV=root
+
+# 
+# Cron uses a conservative $PATH
+#
+PATH=/usr/bin:/usr/sbin:/sbin:/bin
+
+#
+# Grep sucks.
+#
+export LANG=en_US.UTF-8
+
+#
+# Script start here.
+#
+target_devs=""
+cdroms=""
+grow=0
+tag=lvmsetup_done
+do_resize2fs=0
+
+# For our security.
+[ -z "$VG" ] && exit 2
+[ -z "$LV" ] && exit 2
+
+sigint() {
+    echo "lvmsetup process interrupted." >> $debug_out
+    exit 1
+}
+
+# Trap interruptions to make sure we die correctly.
+trap sigint SIGINT
+
+# Handling debugging.
+debug_out=/dev/null
+debug_noact=0
+while [ ! -z "$1" ]; do
+    if [ $1 = "debug" ]; then
+        debug_out=/dev/stdout
+    fi
+    if [ $1 = "noact" ]; then
+        debug_noact=1
+    fi
+    shift
+done
+
+# Handle noact.
+if [ $debug_noact -eq 1 ]; then
+    echo "Won't touch anything" >> $debug_out
+fi
+
+# Look for unpartitioned disks.
+for i in /dev/disk/by-path/*[^t][0-9]; do
+    disk_path=$(readlink -f $i)
+
+    echo "Evaluating disk $disk_path" >> $debug_out
+
+    # CDROMS are visible in /dev/disk, but we don't want to deal with
+    # them.  Skip CDROMs based of whether they have a link as
+    # /dev/cdrom*.  This is not a safe assumptions to do on all Linux
+    # system, but safe enough in our case.
+    for i in /dev/cdrom*; do
+        cdroms="$cdroms "$(readlink -f $i)
+    done
+    echo $cdroms | grep -q $disk_path
+    is_not_cdrom=$?
+
+    if [ $is_not_cdrom -eq 0 ]; then
+        echo "Skipping disk $disk_path, it's a CD-ROM" >> $debug_out
+        continue
+    fi  
+
+    # Check if there is any partition on the disk we are examining.
+    # If so, they should have a entry in /dev.  This is probably not
+    # totally safe either but this as been true as far as I have used
+    # Linux.
+    if [ -z "$(ls -1 $disk_path?* 2> /dev/null)" ]; then
+        # Create an LVM partition on the disk.  Partitions are
+        # examined at the next loop.
+        echo "Empty drive: $disk_path, creating an LVM partition" >> $debug_out
+        
+        # *** This is not a simple echo *** This statement tells
+        # sfdisk to create an LVM partition on the target disk,
+        # spanning the whole size of the disk.
+        if [ $debug_noact -eq 0 ]; then
+            echo "0,,8e,-" | sfdisk $disk_path > /dev/null 2> /dev/null
+        fi
+    fi
+done
+
+# Scan partitions this time.  This loop evaluates what we need to do.
+for i in /dev/disk/by-path/*-part*; do
+    # Check if the path is mounted now.  We can't touch mounted
+    # drives.
+    part_path=$(readlink -f $i)
+    part_id=${part_path:$((${#part_path}-1))}
+    part_disk=${part_path:0:$((${#part_path}-1))}
+    echo "Evaluating partition $part_path" >> $debug_out
+
+    mount | grep -q "$part_path\W" 2> /dev/null
+    is_not_mounted=$?
+
+    if [ $is_not_mounted -eq 0 ]; then
+        echo "Skipping $part_path, it's mounted" >> $debug_out
+        continue
+    fi
+    
+    ptype=$(cfdisk -P t $part_disk | grep -E "^\s*$part_id" | awk '{print $6}')
+
+    if [ "$ptype" == "0x83" ]; then
+        echo "Skipping $part_path, it is a standard Linux partition" >> $debug_out
+        continue
+    fi
+    if [ "$ptype" == "0x05" ]; then
+        echo "Skipping $part_path, it is an extended partition" >> $debug_out
+        continue
+    fi
+    if [ "$ptype" == "0x82" ]; then
+        echo "Skipping $part_path, it is an swap partition" >> $debug_out
+        continue
+    fi    
+    if [ "$ptype" != "0x8E" ]; then
+        echo "Skipping $part_path, it is of unknown partition type $ptype" >> $debug_out
+        continue
+    fi
+
+    # Check the extension
+    pvs_out=$(pvs $part_path --noheadings --units b -opv_name,vg_name,pv_free 2> /dev/null)
+    RES=$?
+    # $1 = pv_name
+    # $2 = vg_name (might be empty)
+    # $3 = pv_free
+    set -- $pvs_out
+
+    # Handle the possibility of initialized physical volume not added
+    # to any volume group.
+    if [ $# == 2 ]; then
+	pv_name=$1
+	pv_free=$2
+	pv_vg_name=
+    elif [ $# == 3 ]; then
+	pv_name=$1
+	pv_vg_name=$2
+	pv_free=$3
+    fi
+
+    # Get the PV tags.
+    if pvs --noheadings -opv_tags $part_path 2> /dev/null | grep -q $tag; then
+        echo "Skipping partition $part_path, it's been done" >> $debug_out
+        continue
+    fi
+
+    # Check that the disk is not a physical volume.
+    if [ $RES != 0 ]; then
+        # Check if it's an LVM partition.
+        blkid $part_path | grep -q lvm2pv
+        has_no_lvm=$?
+        if [ $has_no_lvm == 1 ]; then                                                        
+            echo "Partition $part_path has state 'none'" >> $debug_out
+            target_devs="$part_path:none $target_devs"
+        fi
+
+    # Check that the disk is a physical volume that was not extended
+    # to the main logical volume.
+    elif [ $RES -eq 0 -a -z "$pv_vg_name" ]; then
+        echo "Partition $part_path has state 'pvcreated'" >> $debug_out
+        target_devs="$part_path:pvcreated $target_devs"
+
+    # Check that the disk is a physical volume that was used to extend
+    # the main logical volume.
+    elif [ $RES -eq 0 -a ! -z "$pv_vg_name" ]; then
+        # Check if it's part of our volume group.
+        if [ $pv_vg_name = $VG ]; then              
+
+            # Check if the PV has free space.  If it has none, that
+            # means lvextend has been called.  All that's left to call
+            # is resize2fs.
+            if [ "$pg_free" = "0B" ]; then
+                echo "Partition $part_path has state 'lvextended'" >> $debug_out
+                target_devs="$part_path:lvextended $target_devs"
+
+            # Otherwise, we will need to call lvextend.
+            else
+                echo "Partition $part_path has state 'vgextended'" >> $debug_out
+                target_devs="$part_path:vgextended $target_devs"
+            fi
+        else
+            echo "Partition $part_path is already part of the VG $pg_vg_name, which is unknown" >> $debug_out
+        fi
+
+    # At this point we can't deduce anything from the disk.
+    else
+        echo "Partition $part_path has been properly setup" >> $debug_out
+    fi        
+done
+
+# This loop applies the operations in each partition for which a state
+# has been evaluated.
+if [ ! -z "$target_devs" ]; then
+    for d in $target_devs; do
+        dev=$(echo $d | cut -d  ':' -f 1)
+        state=$(echo $d | cut -d ':' -f 2)
+
+        while [ $state != "ok" -o $state = "error" ]; do
+            case $state in 
+                none)
+                # In this state, nothing has been done.  The partition
+                # has not been initialized has a PV, so we do that.
+                    echo "Creating volume group on $dev" >> $debug_out
+                    if [ $debug_noact -eq 0 ]; then
+                        pvcreate $dev >> $debug_out
+                        RES=$?
+                        if [ $RES -eq 0 ]; then
+                            state="pvcreated"
+                        else
+                            state="error"
+                        fi
+                    else
+                        state="pvcreated"
+                    fi
+                    ;;
+                pvcreated)
+                # In this state, the PV has been initialized.  We need
+                # to extend the VG with the new PV.
+                    echo "Extending volume group '$VG' with $dev" >> $debug_out
+                    if [ $debug_noact -eq 0 ]; then
+                        vgextend $VG $dev >> $debug_out
+                        RES=$?
+                        if [ $RES -eq 0 ]; then
+                            state="vgextended"
+                        else
+                            state="error"
+                        fi
+                    else
+                        state="vgextended"
+                    fi
+                    ;;
+                vgextended)
+                # In this state, the VG has been extended with the PV.
+                # Calculate the size by which we will need to extend
+                # the LV.
+                    gs=$(pvs $dev --noheadings -opv_free --unit m)
+                    RET=$?
+                    if [ $RET -eq 0 ]; then
+                        grow_size=$(echo $gs | tr -d "M" | cut -d "." -f 1 | awk '{print $1}')
+                        grow=$(($grow + $grow_size))
+                        echo "Disk $dev will add $grow_size mb to '$VG' volume" >> $debug_out
+                        state="lvextended"
+                    else
+                        echo "Missing informations about physical volume."
+                        state="lvextended"
+                    fi
+                    ;;
+                lvextended)
+                # In this state, we presume the LV has been extended
+                # to the size of the VG.  All there is left to do is
+                # call resize2fs to resize the master filesystem.
+                    do_resize2fs=1
+                    state="ok"
+                    ;;
+            esac
+        done
+
+        if [ $state = "error" ]; then
+            echo "Failed to properly initialize LVM for $dev" >> $debug_out
+            exit 1
+        fi
+
+        if [ $state = "ok" ]; then
+            echo "Disk $dev successfully initialized with LVM" >> $debug_out
+        fi
+    done
+else
+    echo "Nothing to extend with LVM" >> $debug_out
+fi
+
+# Check if there any space to grow.
+if [ $grow -gt 0 ]; then
+    echo "Growing volume group $VG by $grow bytes" >> $debug_out
+    if [ $debug_noact -eq 0 ]; then
+        lvextend -L+"$grow"m /dev/$VG/$LV >> $debug_out
+        RES=$?
+        if [ $RES -ne 0 ]; then
+            echo "Failed to grow volume group $VG" >> $debug_out
+            exit 1
+        fi
+    fi
+else
+    echo "No partition to resize" >> $debug_out
+fi
+
+# Proceed to resize2fs it's been detected as not done earlier in the
+# process.
+if [ $do_resize2fs -eq 1 ]; then
+    echo "Resizing root partition to fill the space" >> $debug_out
+    if [ $debug_noact -eq 0 ]; then
+        resize2fs /dev/$VG/$LV >> $debug_out 2>&1
+        RES=$?
+        if [ $RES -ne 0 ]; then
+            echo "Failed to fully resize the main partition" >> $debug_out
+            exit 1
+        fi
+    fi
+else
+    echo "No need to call resize2fs" >> $debug_out
+fi
+
+# Tag the physical volume we've grown as done.  That way we will know
+# early on if a partition has been touched by this script.
+if [ ! -z "$target_devs" ]; then
+    for d in $target_devs; do
+        dev=$(echo $d | cut -d  ':' -f 1)
+        pvchange $dev --addtag $tag >> $debug_out
+    done
+else
+    echo "No need to tag anything" >> $debug_out
+fi
+
+exit 0
+

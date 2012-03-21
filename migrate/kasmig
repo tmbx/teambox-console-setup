@@ -1,0 +1,375 @@
+#!/usr/bin/python
+
+import sys, os, getopt
+import kprompt
+from kfile import *
+from krun import *
+from kodict import *
+from kasmodel import *
+
+# Path to the pull repository directory. Slash-terminated.
+pull_dir = "/var/teambox/kasmig/"
+
+class KasMig:
+    def __init__(self):
+        
+        # True if the quiet flag was specified.
+        self.quiet_flag = 0
+        
+        # Tree of component values indexed by component name.
+        self.components = odict()
+        self.components["tbxsos"] = 0
+        self.components["freemium"] = 0
+        self.components["mas"] = 0
+        self.components["wps"] = 0
+        self.components["adminpwd"] = 0
+        self.components["cert"] = 0
+        self.components["net"] = 0
+        
+        # Command ("pull" or "push").
+        self.cmd = None
+        
+        # Remote host to pull from / push to.
+        self.host = None
+        
+        # Name of the pull repository.
+        self.repos = None
+        
+        # Address of the local host.
+        self.local_ip = None
+
+    # Print the usage to a file object (default file object is stdout).
+    def usage(self, file=sys.stdout):
+        s = ""
+        s += "Usage: kasmig {pull|push} <host> [<repos>] <options>\n"
+        s += "\n"
+        s += "Options:\n"
+        s += "  -h, --help        Show this help.\n"
+        s += "  -q, --quiet       Don't ask confirmations.\n"
+        s += "  -c <component>    Add a component. Default to all components.\n"
+        s += "\n"
+        s += "Components:\n"
+        s += "  tbxsos             TBXSOS service data.\n"
+        s += "  freemium          Freemium service data.\n"
+        s += "  mas               MAS service data.\n"
+        s += "  wps               WPS service data.\n"
+        s += "  adminpwd          Administration password.\n"
+        s += "  cert              SSL certificates.\n"
+        s += "  net               Network configuration.\n"
+        s += "\n"
+        s += "The repository defaults to the host if not specified.\n"
+        s += "\n"
+        file.write(s)
+        file.flush()
+    
+    # Display a string to the user if the quiet flag was not specified.
+    def tell_user(self, s):
+        if not self.quiet_flag:
+            sys.stdout.write(s)
+            sys.stdout.flush()
+    
+    # Return a string containing the enabled components. 
+    def get_component_string(self):
+        components = []
+        for c in self.components.keys():
+            if self.components[c]: components.append(c)
+        return " ".join(components)
+        
+    # Return the list of databases from the enabled components.
+    def get_db_list(self):
+        import_list = [ ("mas", "kcd"), ("wps", "kwmo"), ("freemium", "freemium"), ("tbxsos", "tbxsosd_db") ]
+        db_list = []
+        for c, db in import_list:
+            if self.components[c]: db_list.append(db)
+        return db_list
+    
+    # Ask the confirmation to proceed.
+    def ask_confirm(self):
+        if self.quiet_flag: return
+        
+        s = ""
+        s += "===============================================================================\n"
+        s += "Command:     " + self.cmd + "\n"
+        s += "Host:        " + self.host + "\n"
+        s += "Repository:  " + self.repos + "\n"
+        s += "Components:  " + self.get_component_string() + "\n"
+        s += "===============================================================================\n\n"
+        sys.stdout.write(s)
+        
+        if not kprompt.get_confirm("Proceed?"): sys.exit(1)
+    
+    # Execute the specified commands with SSH on the remote host.
+    def remote_ssh_exec(self, cmd_list):
+        cmd_string = " && ".join(cmd_list)
+        show_cmd_output(["ssh", "root@" + self.host, cmd_string])
+    
+    # Command handlers.
+    
+    def handle_pull(self):
+        
+        # Setup our paths.
+        local_dir = pull_dir + self.repos + '/'
+        data_dir = local_dir + 'data/'
+        kfs_dir = local_dir + 'kfs/'
+        local_ip = get_current_server_address()
+        remote_dir = "/tmp/pull-%s-%s/" % (self.repos, local_ip)
+        ssh_host = "root@" + self.host
+        
+        # Get the components and databases to import.
+        components = self.components
+        db_list = self.get_db_list()
+        
+        # Ask the confirmation.
+        self.ask_confirm()
+        
+        # Create all local directories.
+        show_cmd_output(["mkdir", "-p", local_dir, data_dir, kfs_dir])
+        
+        # Write the component file.
+        write_file(local_dir + "components", self.get_component_string() + "\n")
+        
+        # Sync the KFS files before we import the databases.
+        if components["mas"]:
+            self.tell_user("Syncing KFS files.\n")
+            show_cmd_output("rsync --rsh=ssh -az --delete %s:/var/teambox/kas/kfs/ %s" % (ssh_host, kfs_dir))
+        
+        # Import the master.cfg file, the certificates and the databases from
+        # the remote host.
+        cmd_list = []
+        cmd_list.append('rm -rf ' + remote_dir)
+        cmd_list.append('mkdir -p ' + remote_dir)
+        cmd_list.append('cp /etc/teambox/base/master.cfg ' + remote_dir)
+        if components["cert"]: cmd_list.append('cp /etc/teambox/base/cert* ' + remote_dir)
+        if components["tbxsos"]: cmd_list.append('cp -ra /etc/teambox/act ' + remote_dir)
+        for db in db_list:
+            cmd_list.append('pg_dump -Fc %s > %s%s.db' % (db, remote_dir, db))
+        self.tell_user("Gathering configuration and database data.\n")
+        self.remote_ssh_exec(cmd_list)
+        self.tell_user("Syncing configuration and database data.\n")
+        show_cmd_output("rsync --rsh=ssh -az --delete %s:%s %s" % (ssh_host, remote_dir, data_dir))
+        
+        # Resync the KFS files without deleting the extra files after we have
+        # imported the databases. This is not a crash consistent backup, but
+        # it's the best we can do if the services are running.
+        if components["mas"]:
+            self.tell_user("Resyncing KFS files.\n")
+            show_cmd_output("rsync --rsh=ssh -az %s:/var/teambox/kas/kfs/ %s" % (ssh_host, kfs_dir))
+        
+        # Clean up.
+        self.tell_user("Deleting remote pull directory.\n")
+        self.remote_ssh_exec(['rm -rf ' + remote_dir])
+    
+    def handle_push(self):
+        
+        # Setup our paths.
+        local_dir = pull_dir + self.repos + '/'
+        data_dir = local_dir + 'data/'
+        kfs_dir = local_dir + 'kfs/'
+        push_dir = local_dir + 'push-' + self.host + '/'
+        local_ip = get_current_server_address()
+        remote_dir = "/tmp/push-%s-%s/" % (self.repos, local_ip)
+        ssh_host = "root@" + self.host
+        
+        # Get the components and databases to push.
+        components = self.components
+        
+        # Disable any component not enabled in the repository.
+        enabled_components = read_file(local_dir + "components").split()
+        for c in components:
+            if not c in enabled_components: components[c] = 0
+        
+        db_list = self.get_db_list()
+        
+        # Ask the confirmation.
+        self.ask_confirm()
+        
+        # Create the push directory.
+        show_cmd_output("rm -rf " + push_dir)
+        show_cmd_output(["mkdir", push_dir])
+        
+        # Gather the component files.
+        self.tell_user("Gathering configuration and database data.\n")
+        
+        if components["cert"]:
+            os.link(data_dir + "cert.pem", push_dir + "cert.pem")
+            os.link(data_dir + "cert_key.pem", push_dir + "cert_key.pem")
+        
+        if components["tbxsos"]: show_cmd_output("cp -ra %sact %s" % (data_dir, push_dir))
+        
+        for db in db_list:
+            os.link("%s%s.db" % (data_dir, db), "%s%s.db" % (push_dir, db))
+        
+        # Import the master.cfg file from the host.
+        show_cmd_output(["scp", ssh_host + ":/etc/teambox/base/master.cfg", push_dir])
+        
+        # Update the master.cfg file.
+        data_node = RootConfigNode()
+        data_node.load_master_config(data_dir + "master.cfg")
+        
+        push_node = RootConfigNode()
+        push_node.load_master_config(push_dir + "master.cfg")
+        
+        if components["adminpwd"]:
+            push_node.admin_pwd = data_node.admin_pwd
+        
+        if components["net"]:
+            push_node.eth0.method = data_node.eth0.method
+            push_node.eth0.ip = data_node.eth0.ip
+            push_node.eth0.netmask = data_node.eth0.netmask
+            push_node.eth0.gateway = data_node.eth0.gateway
+            push_node.dns_addr_list = data_node.dns_addr_list
+            push_node.hostname = data_node.hostname
+            push_node.domain = data_node.domain
+            push_node.all_port_addr_list = data_node.all_port_addr_list
+            push_node.config_port_addr_list = data_node.config_port_addr_list
+            push_node.sshd_line_list = data_node.sshd_line_list
+        
+        if components["tbxsos"] or components["mas"] or components["wps"]:
+            push_node.kcd_host = data_node.kcd_host
+            push_node.kcd_pwd = data_node.kcd_pwd
+        
+        if components["mas"] or components["wps"]:
+            push_node.kwmo_host = data_node.kwmo_host
+            push_node.kwmo_pwd = data_node.kwmo_pwd
+            
+        if components["mas"]:
+            push_node.mas_service = data_node.mas_service
+            push_node.kcd_enforce_restriction = data_node.kcd_enforce_restriction
+            push_node.kcd_default_kfs_quota = data_node.kcd_default_kfs_quota
+            push_node.kcd_mail_host = data_node.kcd_mail_host
+            push_node.kcd_mail_sender = data_node.kcd_mail_sender
+            push_node.kcd_mail_auth_user = data_node.kcd_mail_auth_user
+            push_node.kcd_mail_auth_pwd = data_node.kcd_mail_auth_pwd
+            push_node.kcd_mail_auth_ssl = data_node.kcd_mail_auth_ssl
+            push_node.kcd_kfs_mode = data_node.kcd_kfs_mode
+            push_node.kcd_kfs_dir = data_node.kcd_kfs_dir
+            push_node.kcd_smb_mount_unc = data_node.kcd_smb_mount_unc
+            push_node.kcd_smb_root = data_node.kcd_smb_root
+            push_node.kcd_smb_mount_user = data_node.kcd_smb_mount_user
+            push_node.kcd_smb_mount_pwd = data_node.kcd_smb_mount_pwd
+            
+            push_node.kcd_organizations = {}
+            for key in data_node.kcd_organizations: push_node.kcd_organizations[key] = data_node.kcd_organizations[key]
+        
+        if components["wps"]:
+            push_node.wps_service = data_node.wps_service
+        
+        if components["tbxsos"]:
+            push_node.tbxsos_service = data_node.tbxsos_service
+        
+        if components["freemium"]:
+            push_node.freemium_service = data_node.freemium_service
+            push_node.freemium_autoregister = data_node.freemium_autoregister
+        
+        push_node.save_master_config(push_dir + "master.cfg")
+        
+        # Stop all remote services, start postgres and create the remote
+        # directory.
+        cmd_list = []
+        cmd_list.append('kplatshell stop')
+        cmd_list.append('kplatshell start postgres')
+        cmd_list.append('mkdir -p ' + remote_dir)
+        self.tell_user("\nPreparing remote host for push.\n")
+        self.remote_ssh_exec(cmd_list)
+        
+        # Push the configuration and database data to the remote host.
+        self.tell_user("Syncing configuration and database data.\n")
+        show_cmd_output("rsync --rsh=ssh -az --delete %s %s:%s" % (push_dir, ssh_host, remote_dir))
+        
+        # Push the KFS data to the remote host.
+        if components["mas"]:
+            self.tell_user("Syncing KFS files.\n")
+            show_cmd_output("rsync --rsh=ssh -az --delete %s %s:/var/teambox/kas/kfs/" % (kfs_dir, ssh_host))
+        
+        # Import the configuration and database data.
+        cmd_list = []
+        
+        if components["cert"]:
+            cmd_list.append('cp %s/*.pem /etc/teambox/base/' % (remote_dir))
+        
+        if components["tbxsos"]:
+            cmd_list.append('rm -rf /etc/teambox/act/')
+            cmd_list.append('cp -ra %s/act /etc/teambox/' % (remote_dir))
+        
+        for db in db_list:
+            sqlpy_name = db
+            if db == "tbxsosd_db":  sqlpy_name = "tbxsosd"
+            sqlpy_path = "/etc/teambox/base-config/" + sqlpy_name + "_db.sqlpy"
+            cmd_list.append('/usr/bin/kexecpg -s drop -s create -s noschema ' + sqlpy_path)
+            cmd_list.append('pg_restore -d %s %s%s.db' % (db, remote_dir, db))
+        
+        if components["adminpwd"]:
+            cmd_list.append('kplatshell set-admin-pwd "%s"' % (push_node.admin_pwd))
+        
+        cmd_list.append('cp %s/master.cfg /etc/teambox/base/' % (remote_dir))
+        cmd_list.append('kplatshell write-service-cfg')
+        cmd_list.append('kplatshell write-network-cfg')
+        cmd_list.append('kplatshell maintenance')
+        cmd_list.append('rm -rf ' + remote_dir)
+        self.tell_user("\nImporting configuration and database data.\n")
+        self.remote_ssh_exec(cmd_list)
+        
+        # Clean up.
+        show_cmd_output('rm -rf ' + push_dir)
+        
+        self.tell_user("\nDone. Restart network interfaces and services as needed.\n")
+        
+def main():
+    try:
+        kasmig = KasMig()
+        
+        # Parse command line options.
+        try:
+            component_flag = 0
+            opts, args = getopt.gnu_getopt(sys.argv[1:], "hqc:", [ "help", "quiet" ])
+            for o, a in opts:
+                if o in ("-h", "--help"):
+                    kasmig.usage()
+                    sys.exit(0)
+                elif o in ("-q", "--quiet"):
+                    kasmig.quiet_flag = 1
+                elif o == "-c":
+                    if not kasmig.components.has_key(a): raise Exception("invalid component '%s'" % (a))
+                    kasmig.components[a] = 1
+                    component_flag = 1
+            
+            if not component_flag:
+                for c in kasmig.components: kasmig.components[c] = 1
+            
+            nb_arg = len(args) 
+            if nb_arg not in (2, 3):
+                kasmig.usage(sys.stderr)
+                sys.exit(1)
+            
+            kasmig.cmd = args[0]
+            kasmig.host = args[1]
+            if nb_arg > 2: kasmig.repos = args[2]
+            else: kasmig.repos = kasmig.host
+            
+            if kasmig.cmd not in ("pull", "push"): raise Exception("invalid command")
+            
+        except Exception, e:
+            sys.stderr.write(str(e) + '\n')
+            kasmig.usage(sys.stderr)
+            sys.exit(1)
+        
+        # Dispatch.
+        if kasmig.cmd == "pull": kasmig.handle_pull()
+        elif kasmig.cmd == "push": kasmig.handle_push()
+
+    except (KeyboardInterrupt, EOFError, SystemExit, Exception), e:
+    
+        # Raise system exit exceptions.
+        if isinstance(e, SystemExit): raise e
+        
+        # Ignore interruptions.
+        elif isinstance(e, KeyboardInterrupt) or isinstance(e, EOFError): return
+         
+        # Print errors.
+        else:
+            raise
+            sys.stderr.write("Error: " + str(e) + ".\n")
+            sys.exit(1)
+     
+main()
+

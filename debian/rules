@@ -1,0 +1,55 @@
+#!/usr/bin/make -f
+
+# Uncomment this to turn on verbose mode.
+# export DH_VERBOSE=1
+
+# This has to be exported to make some magic below work.
+export DH_OPTIONS
+
+
+clean:
+	dh_testdir
+	dh_testroot
+	dh_clean
+
+build:
+install:
+	dh_testdir
+	dh_testroot
+	mkdir -p debian/teambox-console-setup/root/
+	mkdir -p debian/teambox-console-setup/usr/bin
+	mkdir -p debian/teambox-console-setup/usr/share/python-support/teambox-console-setup/
+	mkdir -p debian/teambox-console-setup/etc/init.d/
+	mkdir -p debian/teambox-console-setup/etc/teambox/base
+	mkdir -p debian/teambox-console-setup/etc/teambox/base-config/
+	cp cfg/python/kplatshell.py debian/teambox-console-setup/usr/bin/kplatshell
+	cp cfg/python/kasmodel.py debian/teambox-console-setup/usr/share/python-support/teambox-console-setup/
+	cp cfg/python/kasmodeltool.py debian/teambox-console-setup/usr/share/python-support/teambox-console-setup/
+	for name in setup info maintenance production update debug; do\
+	    ln -s /usr/bin/kplatshell debian/teambox-console-setup/usr/bin/klogin_$$name;\
+	done
+	ln -s /usr/bin/kplatshell debian/teambox-console-setup/etc/issue.script
+	cp -f cfg/bin/* debian/teambox-console-setup/usr/bin/
+	cp -f cfg/init.d/* debian/teambox-console-setup/etc/init.d/
+	cp -f cfg/etc/* debian/teambox-console-setup/etc/teambox/base-config/
+
+binary-arch:
+binary-indep: install
+	dh_testdir
+	dh_testroot
+	dh_installcron
+	dh_installchangelogs
+	dh_installdocs
+	dh_pysupport
+	dh_compress
+	dh_fixperms
+	dh_installdeb
+	dh_gencontrol
+	dh_md5sums
+	dh_builddeb
+
+binary: binary-arch binary-indep
+
+
+.PHONY: build clean binary-indep binary-arch binary install
+

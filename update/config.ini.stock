@@ -1,0 +1,32 @@
+[config]
+
+# IP of the target host to setup.
+ip=
+
+# Name and arguments of the setup script to run on the target host.
+script_name=update.py
+script_arg=
+
+# List of paths to delete remotely before uploading the setup script data.
+delete_paths=update
+
+# True if a confirmation should be asked before proceeding. 
+ask_confirm=1
+
+# Content of the /etc/apt/sources.list file for old updates.
+# The key names are irrelevant, only the values are used. The string 'distrib' is replaced 
+# by the update distribution.
+[old_sources]
+1=deb http://ketchup.teambox.co/debian distrib main
+
+# Content of the /etc/apt/sources.list file for new installations or the last update.
+# The key names are irrelevant, only the values are used. The string 'distrib' is replaced 
+# by the update distribution.
+[sources]
+1=deb http://ketchup.teambox.co/debian k2 main
+
+# SSH tunnels to establish. The key names are irrelevant, only the values are
+# used. Format as in SSH: 'target_host_port:dest_host_name:dest_host_port'.
+[tunnels]
+#1=1111:ketchup:80
+

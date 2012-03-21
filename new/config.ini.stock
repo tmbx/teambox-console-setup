@@ -1,0 +1,29 @@
+[config]
+
+# IP of the target host to setup.
+ip=
+
+# Name and arguments of the setup script to run on the target host. Add the
+# keyword 'debug' in the script arguments to ease testing.
+script_name=bootstrap.sh
+script_arg=
+
+# List of paths to delete remotely before uploading the setup script data.
+delete_paths=new
+
+# True if a confirmation should be asked before proceeding. 
+ask_confirm=1
+
+# Not used for new installations.
+[old_sources]
+
+# Content of the /etc/apt/sources.list file. The key names are irrelevant, only
+# the values are used.
+[sources]
+1=deb http://ketchup.teambox.co/debian k2 main
+
+# SSH tunnels to establish. The key names are irrelevant, only the values are
+# used. Format as in SSH: 'target_host_port:dest_host_name:dest_host_port'.
+[tunnels]
+#1=1111:ketchup:80
+
